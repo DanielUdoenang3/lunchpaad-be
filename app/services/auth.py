@@ -1,293 +1,222 @@
-from fastapi import status, HTTPException
+import secrets
 from datetime import datetime, timedelta
-import random
+
+from fastapi import status
 from sqlalchemy.orm import Session
-import smtplib
-from email.mime.text import MIMEText
-import firebase_admin
-from firebase_admin import auth
-from firebase_admin import credentials
-from app.utils.settings import settings
-from app.utils.pass_hash import hash_password
+
 from app.models import base as models
-from app.schema.base import UserCreate, UserLogin, AuthSuccessResponse
-from app.utils.custom_response import error_response, success_response
 from app.models.base import User
+from app.schema.base import UserCreate, UserLogin
+from app.services.email_services import send_verification_email, send_password_reset_email
+from app.utils.custom_response import error_response, success_response
 from app.utils.pass_hash import hash_password, verify_password
 from app.utils.token import create_access_token
 
-async def create_user(data: UserCreate, db) -> UserCreate:
-    if not data.email or not data.username or not data.password:
-        return error_response(status_code=status.HTTP_400_BAD_REQUEST, message= "Email, username, and password are required fields.")
-    
-    if not db:
-        return error_response(status_code=status.HTTP_400_BAD_REQUEST, message= "Database session is not available.")
-    
+# How long a magic link remains valid
+MAGIC_LINK_EXPIRY_MINUTES = 30
+
+
+# ── Internal helpers ──────────────────────────────────────────────────────────
+
+def get_user_by_email(db: Session, email: str) -> models.User | None:
+    return db.query(models.User).filter(models.User.email == email).first()
+
+
+def get_user_by_magic_token(db: Session, token: str) -> models.User | None:
+    return db.query(models.User).filter(models.User.magic_link_token == token).first()
+
+
+def _generate_and_send_magic_link(db: Session, user: models.User, purpose: str) -> None:
+    """
+    Generate a cryptographically secure token, persist it, and dispatch the email.
+
+    purpose: "verify" → email verification link
+             "reset"  → password reset link
+    """
+    token = secrets.token_urlsafe(32)
+    expiry = datetime.utcnow() + timedelta(minutes=MAGIC_LINK_EXPIRY_MINUTES)
+
+    user.magic_link_token = token
+    user.magic_link_token_expiry = expiry
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+
+    if purpose == "verify":
+        send_verification_email(
+            to_email=user.email,
+            name=user.first_name,
+            token=token,
+        )
+    else:
+        send_password_reset_email(
+            to_email=user.email,
+            token=token,
+        )
+
+
+async def create_user(data: UserCreate, db: Session):
     existing_user = db.query(User).filter(
         (User.email == data.email) | (User.username == data.username)
     ).first()
 
     if existing_user:
-        return error_response(status_code=status.HTTP_400_BAD_REQUEST, message= "User with this email or username already exists.")
-    
-    password_hashed = hash_password(data.password)
+        return error_response(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message="A user with this email or username already exists.",
+        )
 
+    password_hashed = hash_password(data.password)
     if not password_hashed:
-        return error_response(status_code=status.HTTP_400_BAD_REQUEST, message= "Password hashing failed.")
+        return error_response(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            message="Password hashing failed.",
+        )
 
     new_user = User(
         email=data.email,
+        first_name=data.first_name,
+        last_name=data.last_name,
         username=data.username,
-        hashed_password= password_hashed,
+        hashed_password=password_hashed,
+        is_email_verified=False,
     )
-
-    if not new_user:
-        return error_response(status_code=status.HTTP_400_BAD_REQUEST, message= "User creation failed.")
-
 
     db.add(new_user)
     db.commit()
     db.refresh(new_user)
 
-    access_token = create_access_token({"email": new_user.email})
+    _generate_and_send_magic_link(db=db, user=new_user, purpose="verify")
 
-    res = {
-        "email": new_user.email,
-        "username": new_user.username,
-        "created_at": new_user.created_at,
-        "updated_at": new_user.updated_at,
-        "is_active": new_user.is_active,
-        "access_token": access_token 
-    }
+    return success_response(
+        status_code=status.HTTP_201_CREATED,
+        message="Account created successfully. Please check your email to verify your account before logging in.",
+        data={
+            "email": new_user.email,
+            "first_name": new_user.first_name,
+            "last_name": new_user.last_name,
+            "username": new_user.username,
+            "is_email_verified": new_user.is_email_verified,
+        },
+    )
 
-    return success_response(status_code=status.HTTP_201_CREATED, message="User created successfully.", data=res)
 
-async def login_user(data: UserLogin, db) -> UserLogin:
-    if not data.email or not data.password:
-        return error_response(status_code=status.HTTP_400_BAD_REQUEST, message="Email and password are required fields.")
-    
-    if not db:
-        return error_response(status_code=status.HTTP_400_BAD_REQUEST, message="Database session is not available.")
-
+async def login_user(data: UserLogin, db: Session):
     user = db.query(User).filter(User.email == data.email).first()
 
     if not user or not verify_password(data.password, user.hashed_password):
-        return error_response(status_code=status.HTTP_401_UNAUTHORIZED, message="Invalid email or password.")
+        return error_response(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            message="Invalid email or password.",
+        )
+
+    if not user.is_email_verified:
+        return error_response(
+            status_code=status.HTTP_403_FORBIDDEN,
+            message="Your email address is not verified. Please check your inbox for the verification link.",
+        )
 
     access_token = create_access_token({"email": user.email})
 
-    res = {
-        "email": user.email,
-        "username": user.username,
-        "created_at": user.created_at,
-        "updated_at": user.updated_at,
-        "is_active": user.is_active,
-        "access_token": access_token
-    }
+    return success_response(
+        status_code=status.HTTP_200_OK,
+        message="Login successful.",
+        data={
+            "email": user.email,
+            "first_name": user.first_name,
+            "last_name": user.last_name,
+            "username": user.username,
+            "created_at": user.created_at,
+            "updated_at": user.updated_at,
+            "is_active": user.is_active,
+            "is_email_verified": user.is_email_verified,
+            "access_token": access_token,
+        },
+    )
 
-    return success_response(status_code=status.HTTP_200_OK, message="Login successful.", data=res)
 
-def get_user_by_email(db: Session, email: str) -> models.User | None:
-    """
-    Retrieves a user from the database by their email address.
-    """
-    return db.query(models.User).filter(models.User.email == email).first()
+async def verify_email_token(db: Session, token: str):
+    """Consume a verification token and mark the account as verified."""
+    user = get_user_by_magic_token(db, token)
 
-def send_reset_email(to_email: str, code: str):
-    subject = "Your Password Reset Code"
-    # The email body now includes the 6-digit code
-    body = f"Your password reset code from GIDE.AFRICA  is: {code}\n\n"
-    #This code is valid for 20 minutes. Please enter this code on the password reset page to set your new password."
-    
-    msg = MIMEText(body)
-    msg["Subject"] = subject
-    msg["From"] = settings.MAIL_USERNAME
-    msg["To"] = to_email
+    if not user or not user.magic_link_token_expiry or user.magic_link_token_expiry < datetime.utcnow():
+        return error_response(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message="This verification link is invalid or has expired. Please request a new one.",
+        )
 
-    try:
-        print("Connecting to email server...")
-        with smtplib.SMTP_SSL(settings.MAIL_SERVER, settings.MAIL_PORT) as server:
-            server.login(settings.MAIL_USERNAME, settings.MAIL_PASSWORD)
-            server.sendmail(settings.MAIL_USERNAME, to_email, msg.as_string())
-        print("Email sent!")
-    except Exception as e:
-        print("Failed to send email:", e)
-
-def set_password_reset_code(db: Session, user: models.User, code: str):
-    """
-    Sets a password reset code for a user with an expiry time.
-    """
-    user.reset_code = code
-    # Set code expiry to 20 minutes from now
-    user.reset_code_expiry = datetime.utcnow() + timedelta(minutes=20)
+    user.is_email_verified = True
+    user.magic_link_token = None
+    user.magic_link_token_expiry = None
     db.add(user)
     db.commit()
-    db.refresh(user)
 
-def generate_and_send_reset_code(db: Session, user: models.User):
-    """
-    Generates a 6-digit reset code, stores it in the database,
-    and sends it to the user's email.
-    """
-    reset_code = str(random.randint(100000, 999999))
-    set_password_reset_code(db, user, reset_code)
-    # Assuming send_reset_email takes 'to_email' and 'code' arguments
-    send_reset_email(to_email=user.email, code=reset_code)
+    return success_response(
+        status_code=status.HTTP_200_OK,
+        message="Email verified successfully. You can now log in.",
+        data=None,
+    )
 
-def verify_reset_code(db: Session, email: str, code: str) -> bool:
-    """
-    Verifies if a given reset code for an email is valid and not expired.
-    """
+
+async def resend_verification_link(db: Session, email: str):
+    """Re-send a verification magic link."""
     user = get_user_by_email(db, email)
-    # Check if user exists, code matches, and code has not expired
-    if not user or user.reset_code != code:
-        return False
-    if not user.reset_code_expiry or user.reset_code_expiry < datetime.utcnow():
-        return False
-    return True
 
-def update_user_password(db: Session, email: str, new_password: str) -> bool:
+    if user and user.is_email_verified:
+        return success_response(
+            status_code=status.HTTP_200_OK,
+            message="Your email is already verified. You can log in.",
+            data=None,
+        )
+
+    # Send only when the user exists and is not verified.
+    # Return the same message regardless to avoid account enumeration.
+    if user:
+        _generate_and_send_magic_link(db, user, purpose="verify")
+
+    return success_response(
+        status_code=status.HTTP_200_OK,
+        message="If an unverified account with that email exists, a new verification link has been sent.",
+        data=None,
+    )
+
+
+# ── Password Reset ────────────────────────────────────────────────────────────
+
+async def forgot_password(db: Session, email: str):
     """
-    Updates the user's password in the database.
+    Send a password-reset magic link.
+    Returns the same response whether the email exists or not to prevent enumeration.
     """
     user = get_user_by_email(db, email)
     if user:
-        user.hashed_password = hash_password(new_password)
-        db.commit()
-        # db.refresh(table)
-        return True
-    return False
+        _generate_and_send_magic_link(db, user, purpose="reset")
 
-def clear_reset_code(db: Session, user: models.User) -> bool:
-    """
-    Clears the reset code and expiry time for a user.
-    """
-    try:
-        user.reset_code = None
-        user.reset_code_expiry = None
-        db.add(user)
-        db.commit()
-        db.refresh(user)
-        return True
-    except Exception as e:
-        print(e)
+    return success_response(
+        status_code=status.HTTP_200_OK,
+        message="If an account with that email exists, a password reset link has been sent.",
+        data=None,
+    )
+
+
+async def reset_password(db: Session, token: str, new_password: str):
+    """Consume a password-reset token and update the user's password."""
+    user = get_user_by_magic_token(db, token)
+
+    if not user or not user.magic_link_token_expiry or user.magic_link_token_expiry < datetime.utcnow():
         return error_response(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            message="Failed to clear reset code."
+            status_code=status.HTTP_400_BAD_REQUEST,
+            message="This reset link is invalid or has expired. Please request a new one.",
         )
 
-def initialize_firebase():
-    firebase_credentials_path = settings.GOOGLE_APPLICATION_CREDENTIALS
+    user.hashed_password = hash_password(new_password)
+    user.magic_link_token = None
+    user.magic_link_token_expiry = None
+    db.add(user)
+    db.commit()
 
-    if not firebase_credentials_path:
-        raise ValueError("GOOGLE_APPLICATION_CREDENTIALS is not set in .env file")
-
-    cred = credentials.Certificate(firebase_credentials_path)
-    firebase_admin.initialize_app(cred)
-    print("Firebase Admin SDK initialized successfully.")
-
-# def handle_google_signin(db: Session, firebase_id_token: str) -> AuthSuccessResponse:
-#         decoded_token = auth.verify_id_token(firebase_id_token)
-#         email = decoded_token.get("email")
-
-#         if not email:
-#             raise HTTPException(status_code=400, detail="Email not found in Google token.")
-
-#         user = db.query(User).filter(User.email == email).first()
-
-#         if not user:
-#             raise HTTPException(status_code=404, detail="User not found.")
-
-#         access_token = create_access_token({"email": user.email})
-        
-#         return {
-#             "id": user.id,
-#             "email": user.email,
-#             "username": user.username,
-#             "access_token": access_token
-#         }
-
-# async def handle_google_signup(db: Session, firebase_id_token: str):
-#     decoded_token = auth.verify_id_token(firebase_id_token)
-#     email = decoded_token.get("email")
-#     name = decoded_token.get("name") or "GoogleUser"
-
-#     if not email:
-#         raise HTTPException(status_code=400, detail="Email not found in Google token.")
-
-#     existing_user = db.query(User).filter(User.email == email).first()
-    
-#     if existing_user:
-#         raise HTTPException(status_code=409, detail="User already exists.")
-
-#     dummy_password = hash_password(firebase_id_token[:12])  # Not used for login
-
-#     new_user = User(
-#         email=email,
-#         username=name,
-#         hashed_password=dummy_password
-#     )
-#     db.add(new_user)
-#     db.commit()
-#     db.refresh(new_user)
-
-#     access_token = create_access_token(data={"email": new_user.email})
-    
-#     return {
-#         "id": new_user.id,
-#         "email": new_user.email,
-#         "username": new_user.username,
-#         "access_token": access_token
-#     }
-
-async def google_sign_in_sign_up(db: Session, firebase_id_token: str):
-    decoded_token = auth.verify_id_token(firebase_id_token)
-    email = decoded_token.get("email")
-    name = decoded_token.get("name") or "GoogleUser"
-
-    if not email:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Email not found in Google token.")
-    
-    user = db.query(User).filter(User.email == email).first()
-
-    if user:
-        access_token = create_access_token({"email": user.email})
-        
-        res = {
-            "id": user.id,
-            "email": user.email,
-            "username": user.username,
-            "access_token": access_token
-        }
-
-        return success_response(
-            status_code=status.HTTP_200_OK,
-            message="Login In successfully",
-            data=res
-        )
-    else:
-        dummy_password = hash_password(firebase_id_token[:12])  # Not used for login
-
-        new_user = User(
-            email=email,
-            username=name,
-            hashed_password=dummy_password
-        )
-        db.add(new_user)
-        db.commit()
-        db.refresh(new_user)
-
-        access_token = create_access_token({"email": new_user.email})
-
-        res={
-            "id": new_user.id,
-            "email": new_user.email,
-            "username": new_user.username,
-            "access_token": access_token
-        }
-
-        return success_response(
-            status_code=status.HTTP_200_OK,
-            message="User created successfully",
-            data=res
-        )
+    return success_response(
+        status_code=status.HTTP_200_OK,
+        message="Password reset successfully. You can now log in.",
+        data=None,
+    )
