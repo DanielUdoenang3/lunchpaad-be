@@ -15,6 +15,7 @@ origins = [
     settings.FE_URL,
     "http://localhost:3000",
     "http://localhost:8000",
+    "https://shopperly-fe.vercel.app"
 ]
 
 app.add_middleware(
